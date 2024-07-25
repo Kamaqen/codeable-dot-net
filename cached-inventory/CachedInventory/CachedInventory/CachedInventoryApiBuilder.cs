@@ -3,9 +3,11 @@ namespace CachedInventory;
 using Microsoft.AspNetCore.Mvc;
 
 public static class CachedInventoryApiBuilder
-{
+{ 
   public static WebApplication Build(string[] args)
   {
+    // create a cache object to store the stock of each product
+    var cache = new Dictionary<int, int>();
     var builder = WebApplication.CreateBuilder(args);
 
     // Add services to the container.
@@ -13,6 +15,8 @@ public static class CachedInventoryApiBuilder
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen();
     builder.Services.AddScoped<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
+    // inject the cache object into the service container
+    builder.Services.AddSingleton(cache);
 
     var app = builder.Build();
 
@@ -27,7 +31,18 @@ public static class CachedInventoryApiBuilder
 
     app.MapGet(
         "/stock/{productId:int}",
-        async ([FromServices] IWarehouseStockSystemClient client, int productId) => await client.GetStock(productId))
+        async ([FromServices] IWarehouseStockSystemClient client, int productId) => {
+          // si el producto ya esta en cache, no es necesario hacer una llamada al servicio
+          if(cache.has(productId))
+          {
+            return cache.get(productId);
+          }
+          
+          // caso contrario, se hace la llamada al servicio y se guarda en cache
+          var stock = await client.GetStock(productId);
+          cache.set(productId, stock);
+          return stock;
+          })
       .WithName("GetStock")
       .WithOpenApi();
 
@@ -52,7 +67,19 @@ public static class CachedInventoryApiBuilder
         "/stock/restock",
         async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RestockRequest req) =>
         {
-          var stock = await client.GetStock(req.ProductId);
+          var stock
+          // si el producto ya esta en cache, no es necesario hacer una llamada al servicio
+          if(cache.has(productId))
+          {
+            stock = cache.get(req.ProductId);
+          }
+          // caso contrario, se hace la llamada al servicio y se guarda en cache
+          else
+          {
+            stock = await client.GetStock(req.ProductId);
+            cache.set(req.ProductId, stock);
+          }
+          // var stock = await client.GetStock(req.ProductId);
           await client.UpdateStock(req.ProductId, req.Amount + stock);
           return Results.Ok();
         })
