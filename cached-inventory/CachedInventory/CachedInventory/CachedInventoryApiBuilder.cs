@@ -1,6 +1,5 @@
 namespace CachedInventory;
 
-using System.Collections.Concurrent;
 using Microsoft.AspNetCore.Mvc;
 
 public static class CachedInventoryApiBuilder
@@ -8,19 +7,12 @@ public static class CachedInventoryApiBuilder
   public static WebApplication Build(string[] args)
   {
     var builder = WebApplication.CreateBuilder(args);
-    var cache = new ConcurrentDictionary<int, int>();
-    var timers = new ConcurrentDictionary<int, Timer>();
-    var semaphores = new ConcurrentDictionary<int, SemaphoreSlim>();
 
     // Add services to the container.
+    // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
     builder.Services.AddEndpointsApiExplorer();
     builder.Services.AddSwaggerGen();
     builder.Services.AddScoped<IWarehouseStockSystemClient, WarehouseStockSystemClient>();
-
-    // Inject the cache object and other dictionaries into the service container
-    builder.Services.AddSingleton(cache);
-    builder.Services.AddSingleton(timers);
-    builder.Services.AddSingleton(semaphores);
 
     var app = builder.Build();
 
@@ -35,129 +27,39 @@ public static class CachedInventoryApiBuilder
 
     app.MapGet(
         "/stock/{productId:int}",
-        async (
-          [FromServices] IWarehouseStockSystemClient client,
-          [FromServices] ConcurrentDictionary<int, int> cache,
-          int productId
-        ) =>
-        {
-          if (cache.TryGetValue(productId, out var cachedStock))
-          {
-            return Results.Ok(cachedStock);
-          }
-
-          var stock = await client.GetStock(productId);
-          cache[productId] = stock;
-          return Results.Ok(stock);
-        }
-      )
+        async ([FromServices] IWarehouseStockSystemClient client, int productId) => await client.GetStock(productId))
       .WithName("GetStock")
       .WithOpenApi();
 
     app.MapPost(
         "/stock/retrieve",
-        async (
-          [FromServices] IWarehouseStockSystemClient client,
-          [FromServices] ConcurrentDictionary<int, int> cache,
-          [FromServices] ConcurrentDictionary<int, Timer> timers,
-          [FromServices] ConcurrentDictionary<int, SemaphoreSlim> semaphores,
-          [FromBody] RetrieveStockRequest req
-        ) =>
+        async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RetrieveStockRequest req) =>
         {
-          var semaphore = semaphores.GetOrAdd(req.ProductId, new SemaphoreSlim(1, 1));
-          await semaphore.WaitAsync();
-
-          try
+          var stock = await client.GetStock(req.ProductId);
+          if (stock < req.Amount)
           {
-            if (cache.TryGetValue(req.ProductId, out var cachedStock) && cachedStock >= req.Amount)
-            {
-              cache[req.ProductId] = cachedStock - req.Amount;
-              ResetTimer(req.ProductId, client, cache, timers);
-              return Results.Ok();
-            }
-
-            var stock = await client.GetStock(req.ProductId);
-            if (stock < req.Amount)
-            {
-              return Results.BadRequest("Not enough stock.");
-            }
-
-            cache[req.ProductId] = stock - req.Amount;
-            ResetTimer(req.ProductId, client, cache, timers);
-            return Results.Ok();
+            return Results.BadRequest("Not enough stock.");
           }
-          finally
-          {
-            semaphore.Release();
-          }
-        }
-      )
+
+          await client.UpdateStock(req.ProductId, stock - req.Amount);
+          return Results.Ok();
+        })
       .WithName("RetrieveStock")
       .WithOpenApi();
 
+
     app.MapPost(
         "/stock/restock",
-        async (
-          [FromServices] IWarehouseStockSystemClient client,
-          [FromServices] ConcurrentDictionary<int, int> cache,
-          [FromServices] ConcurrentDictionary<int, Timer> timers,
-          [FromServices] ConcurrentDictionary<int, SemaphoreSlim> semaphores,
-          [FromBody] RestockRequest req
-        ) =>
+        async ([FromServices] IWarehouseStockSystemClient client, [FromBody] RestockRequest req) =>
         {
-          var semaphore = semaphores.GetOrAdd(req.ProductId, new SemaphoreSlim(1, 1));
-          await semaphore.WaitAsync();
-
-          try
-          {
-            var stock = await client.GetStock(req.ProductId);
-            cache[req.ProductId] = req.Amount + stock;
-            ResetTimer(req.ProductId, client, cache, timers);
-            return Results.Ok();
-          }
-          finally
-          {
-            semaphore.Release();
-          }
-        }
-      )
+          var stock = await client.GetStock(req.ProductId);
+          await client.UpdateStock(req.ProductId, req.Amount + stock);
+          return Results.Ok();
+        })
       .WithName("Restock")
       .WithOpenApi();
 
     return app;
-  }
-
-  private static void ResetTimer(
-    int productId,
-    IWarehouseStockSystemClient client,
-    ConcurrentDictionary<int, int> cache,
-    ConcurrentDictionary<int, Timer> timers
-  )
-  {
-    if (timers.TryGetValue(productId, out var existingTimer))
-    {
-      existingTimer.Change(2500, Timeout.Infinite);
-    }
-    else
-    {
-      var newTimer = new Timer(
-        async state =>
-        {
-          if (state != null)
-          {
-            var pid = (int)state;
-            if (cache.TryGetValue(pid, out var stock))
-            {
-              await client.UpdateStock(pid, stock);
-            }
-          }
-        },
-        productId,
-        2500,
-        Timeout.Infinite
-      );
-      timers[productId] = newTimer;
-    }
   }
 }
 
